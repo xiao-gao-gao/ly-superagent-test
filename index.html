@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>黄金矿工</title>
+<style>
+  :root {
+    --gold: #f5b942;
+    --soil: #7a5230;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1d2a38;
+    font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    color: #fff;
+    overflow: hidden;
+  }
+  #app {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    height: 100%;
+    padding: 12px;
+  }
+  h1 {
+    margin: 0 0 8px;
+    font-size: 22px;
+    letter-spacing: 2px;
+    color: var(--gold);
+    text-shadow: 0 2px 4px rgba(0,0,0,.5);
+  }
+  #stage {
+    position: relative;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 8px 30px rgba(0,0,0,.5);
+    border: 2px solid #0e141a;
+  }
+  canvas { display: block; }
+  #hud {
+    position: absolute;
+    top: 8px;
+    left: 12px;
+    right: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    pointer-events: none;
+    font-size: 15px;
+    text-shadow: 0 1px 2px rgba(0,0,0,.7);
+  }
+  #hud .stat { font-weight: 700; }
+  #hud .money { color: #ffd76e; }
+  #hud .time { color: #8fd0ff; }
+  #hud .goal { color: #a7f3c8; }
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10, 16, 22, .78);
+    text-align: center;
+    gap: 10px;
+  }
+  #overlay h2 { margin: 0; font-size: 30px; color: var(--gold); }
+  #overlay p { margin: 0; font-size: 16px; opacity: .9; }
+  button {
+    pointer-events: auto;
+    cursor: pointer;
+    border: 0;
+    border-radius: 999px;
+    padding: 10px 26px;
+    font-size: 16px;
+    font-weight: 700;
+    color: #3a2500;
+    background: linear-gradient(#ffe08a, #f5b942);
+    box-shadow: 0 3px 0 #a06f1a, 0 6px 14px rgba(0,0,0,.4);
+  }
+  button:active { transform: translateY(2px); box-shadow: 0 1px 0 #a06f1a; }
+  #tip {
+    font-size: 13px;
+    color: #cfd8e3;
+    opacity: .85;
+    margin-top: 6px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>⛏️ 黄金矿工</h1>
+  <div id="stage">
+    <canvas id="game" width="720" height="540"></canvas>
+    <div id="hud">
+      <span class="stat money">💰 <span id="money">0</span></span>
+      <span class="stat goal">🎯 目标 <span id="goal">0</span></span>
+      <span class="stat">关卡 <span id="level">1</span></span>
+      <span class="stat time">⏱ <span id="time">60</span>s</span>
+    </div>
+    <div id="overlay">
+      <h2 id="overlay-title">黄金矿工</h2>
+      <p id="overlay-text">抓取地下的黄金与钻石，在时间结束前赚够目标金额！</p>
+      <button id="start-btn">开始游戏</button>
+    </div>
+  </div>
+  <div id="tip">← → 方向键或鼠标移动 调整角度 · 空格或点击 下钩</div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width;
+  const H = canvas.height;
+
+  const elMoney = document.getElementById("money");
+  const elGoal = document.getElementById("goal");
+  const elLevel = document.getElementById("level");
+  const elTime = document.getElementById("time");
+  const overlay = document.getElementById("overlay");
+  const overlayTitle = document.getElementById("overlay-title");
+  const overlayText = document.getElementById("overlay-text");
+  const startBtn = document.getElementById("start-btn");
+
+  // ---- game config ----
+  const PIVOT = { x: W / 2, y: 118 };      // 矿工/吊臂支点
+  const HOOK_LEN = 34;                      // 钩爪半长
+  const ROPE_MIN = 26;
+  const ROPE_MAX = 430;
+  const ROPE_SPEED = 3.2;                   // 伸出/收回速度
+  const SWING_SPEED = 0.028;                // 摆动角速度 (rad/frame)
+  const TIME_PER_LEVEL = 60;                // 每关秒数
+
+  // 物品类型：name, base value, size range, color
+  const ITEM_TYPES = [
+    { name: "黄金", value: 300, min: 18, max: 42, color: "#f7c33d", weight: 1.0, rare: false },
+    { name: "黄金", value: 600, min: 42, max: 64, color: "#f0a820", weight: 1.9, rare: false },
+    { name: "钻石", value: 900, min: 14, max: 26, color: "#7ce8ff", weight: 0.6, rare: true },
+    { name: "石头", value: 60,  min: 22, max: 48, color: "#9b8c84", weight: 2.6, rare: false },
+  ];
+
+  // ---- state ----
+  let state = "idle";   // idle | aiming | shooting | pulling | over
+  let angle = 0;        // 与垂直线的夹角(弧度)，正为顺时针
+  let angleDir = 1;
+  let ropeLen = ROPE_MIN;
+  let claw = { x: PIVOT.x, y: PIVOT.y + ROPE_MIN, grabbed: null };
+  let money = 0;
+  let level = 1;
+  let timeLeft = TIME_PER_LEVEL;
+  let goal = 0;
+  let items = [];
+  let dust = [];
+  let lastTs = 0;
+  let acc = 0;
+  let frame = 0;
+  let result = null;    // { win: bool }
+
+  // ---- helpers ----
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+  function clawPosition(len, ang) {
+    return {
+      x: PIVOT.x + Math.sin(ang) * len,
+      y: PIVOT.y + Math.cos(ang) * len,
+    };
+  }
+
+  function scoreFor(item) {
+    return Math.round(item.value * (item.size / 40) * 10) / 10;
+  }
+
+  function spawnItem(levelIndex) {
+    const weights = [4, 2.5, 0.8, 3.2]; // 按稀有度分配
+    // 难度：高级关卡增加钻石/大金概率
+    const adj = weights.map((w, i) =>
+      i === 2 ? w * (1 + levelIndex * 0.15) : i === 1 ? w * (1 + levelIndex * 0.08) : w
+    );
+    const total = adj.reduce((a, b) => a + b, 0);
+    let r = Math.random() * total;
+    let idx = 0;
+    for (let i = 0; i < adj.length; i++) { r -= adj[i]; if (r <= 0) { idx = i; break; } }
+    const t = ITEM_TYPES[idx];
+    const size = rand(t.min, t.max);
+    const x = rand(46, W - 46);
+    const y = rand(200, H - 34);
+    return { x, y, size, type: idx, value: t.value, weight: t.weight, color: t.color };
+  }
+
+  function generateLevel(levelIndex) {
+    items = [];
+    const count = Math.min(9 + levelIndex * 2, 22);
+    for (let i = 0; i < count; i++) {
+      const it = spawnItem(levelIndex);
+      // 避免过于重叠
+      let tries = 0;
+      while (tries++ < 12) {
+        const overlap = items.some(o => Math.hypot(o.x - it.x, o.y - it.y) < (o.size + it.size));
+        if (!overlap) break;
+        it.x = rand(46, W - 46);
+        it.y = rand(200, H - 34);
+      }
+      items.push(it);
+    }
+    goal = Math.round(500 * levelIndex * 1.35 + 400);
+    timeLeft = TIME_PER_LEVEL;
+  }
+
+  function resetForLevel() {
+    generateLevel(level);
+    angle = 0;
+    angleDir = 1;
+    ropeLen = ROPE_MIN;
+    claw.grabbed = null;
+    result = null;
+    updateHud();
+  }
+
+  function updateHud() {
+    elMoney.textContent = Math.floor(money);
+    elGoal.textContent = goal;
+    elLevel.textContent = level;
+    elTime.textContent = Math.max(0, Math.ceil(timeLeft));
+  }
+
+  // ---- claw logic ----
+  function shoot() {
+    if (state !== "aiming") return;
+    state = "shooting";
+    claw.grabbed = null;
+  }
+
+  function grabAt(x, y) {
+    for (const it of items) {
+      if (Math.hypot(it.x - x, it.y - y) < it.size + HOOK_LEN) return it;
+    }
+    return null;
+  }
+
+  function updateAiming() {
+    angle += SWING_SPEED * angleDir;
+    if (angle > 1.15) { angle = 1.15; angleDir = -1; }
+    if (angle < -1.15) { angle = -1.15; angleDir = 1; }
+  }
+
+  function updateShooting() {
+    ropeLen += ROPE_SPEED;
+    const pos = clawPosition(ropeLen, angle);
+    if (ropeLen >= ROPE_MAX || pos.x < 8 || pos.x > W - 8 || pos.y >= H - 6) {
+      ropeLen = clamp(ropeLen, ROPE_MIN, ROPE_MAX);
+      state = "pulling";
+      return;
+    }
+    const hit = grabAt(pos.x, pos.y);
+    if (hit) {
+      claw.grabbed = hit;
+      state = "pulling";
+    }
+  }
+
+  function updatePulling() {
+    const speed = claw.grabbed
+      ? Math.max(0.7, ROPE_SPEED * (1 - claw.grabbed.weight * 0.22))
+      : ROPE_SPEED;
+    ropeLen -= speed;
+    if (ropeLen <= ROPE_MIN) {
+      ropeLen = ROPE_MIN;
+      if (claw.grabbed) {
+        const s = scoreFor(claw.grabbed);
+        money += s;
+        dust.push({ x: PIVOT.x, y: PIVOT.y + ROPE_MIN, life: 30, text: `+${s}` });
+        items = items.filter(i => i !== claw.grabbed);
+        claw.grabbed = null;
+      }
+      updateHud();
+      checkLevelEnd();
+      if (state === "aiming") updateHud();
+    }
+  }
+
+  function checkLevelEnd() {
+    if (money >= goal) {
+      level++;
+      result = { win: true };
+      endLevel();
+    } else if (timeLeft <= 0) {
+      result = { win: false };
+      endLevel();
+    }
+  }
+
+  function endLevel() {
+    state = "over";
+    overlay.style.display = "flex";
+    if (result.win) {
+      overlayTitle.textContent = "🎉 过关！";
+      overlayText.textContent = `本关目标 ${goal} 已达成，进入第 ${level} 关。`;
+      startBtn.textContent = "下一关";
+    } else {
+      overlayTitle.textContent = "😵 时间到";
+      overlayText.textContent = `你共赚取了 ${Math.floor(money)}，目标 ${goal} 未达成。`;
+      startBtn.textContent = "重新开始";
+    }
+  }
+
+  function startGame() {
+    overlay.style.display = "none";
+    level = 1;
+    money = 0;
+    resetForLevel();
+    state = "aiming";
+  }
+
+  function nextLevel() {
+    overlay.style.display = "none";
+    resetForLevel();
+    state = "aiming";
+  }
+
+  function advance() {
+    if (state !== "over") return;
+    if (result && result.win) nextLevel();
+    else startGame();
+  }
+
+  // ---- rendering ----
+  function drawSky() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#274b6d");
+    g.addColorStop(0.35, "#8fb7d9");
+    g.addColorStop(0.4, "#c8a06a");
+    g.addColorStop(1, "#8a5a32");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // 云
+    ctx.fillStyle = "rgba(255,255,255,.85)";
+    ctx.beginPath();
+    ctx.arc(120, 52, 22, 0, 7);
+    ctx.arc(148, 46, 26, 0, 7);
+    ctx.arc(176, 54, 20, 0, 7);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(560, 70, 20, 0, 7);
+    ctx.arc(586, 64, 24, 0, 7);
+    ctx.arc(612, 72, 18, 0, 7);
+    ctx.fill();
+  }
+
+  function drawSoil() {
+    // 泥土纹理
+    ctx.fillStyle = "#8a5a32";
+    ctx.fillRect(0, 190, W, H - 190);
+    ctx.fillStyle = "rgba(0,0,0,.08)";
+    for (let i = 0; i < 60; i++) {
+      const x = ((i * 97) % W);
+      const y = 200 + ((i * 53) % (H - 210));
+      ctx.beginPath();
+      ctx.arc(x, y, rand(1, 3), 0, 7);
+      ctx.fill();
+    }
+  }
+
+  function drawItems() {
+    for (const it of items) {
+      if (it === claw.grabbed) continue;
+      drawItem(it, it.x, it.y, it.size);
+    }
+  }
+
+  function drawItem(it, x, y, size) {
+    ctx.save();
+    ctx.translate(x, y);
+    // 光泽
+    const g = ctx.createRadialGradient(-size * 0.3, -size * 0.3, size * 0.1, 0, 0, size);
+    if (it.type === 2) { // 钻石（菱形）
+      g.addColorStop(0, "#eafcff");
+      g.addColorStop(1, it.color);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.moveTo(0, -size);
+      ctx.lineTo(size, 0);
+      ctx.lineTo(0, size);
+      ctx.lineTo(-size, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,.7)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else if (it.type === 3) { // 石头（不规则）
+      g.addColorStop(0, "#b7aca3");
+      g.addColorStop(1, it.color);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.moveTo(-size, size * 0.4);
+      ctx.lineTo(-size * 0.5, -size * 0.9);
+      ctx.lineTo(size * 0.4, -size);
+      ctx.lineTo(size, size * 0.1);
+      ctx.lineTo(size * 0.5, size);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,.2)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else { // 黄金（圆）
+      g.addColorStop(0, "#ffe08a");
+      g.addColorStop(1, it.color);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(0, 0, size, 0, 7);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(160,110,20,.5)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawMiner() {
+    // 矿工身体
+    ctx.save();
+    ctx.translate(PIVOT.x, PIVOT.y - 10);
+    ctx.fillStyle = "#e8c39a";
+    ctx.beginPath();
+    ctx.arc(0, 0, 16, 0, 7);
+    ctx.fill();
+    ctx.fillStyle = "#d32f2f";
+    ctx.beginPath();
+    ctx.arc(0, -4, 15, Math.PI, 0);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.arc(0, -6, 7, Math.PI, 0);
+    ctx.fill();
+    ctx.strokeStyle = "#6d4c41";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 0, 16, 0, 7);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawClaw() {
+    const pos = clawPosition(ropeLen, angle);
+    // 绳子
+    ctx.strokeStyle = "#5b4632";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(PIVOT.x, PIVOT.y);
+    ctx.lineTo(pos.x, pos.y);
+    ctx.stroke();
+
+    // 钩爪（三爪）
+    ctx.save();
+    ctx.translate(pos.x, pos.y);
+    ctx.rotate(angle);
+    const grab = claw.grabbed;
+    const open = state === "shooting" && !grab;
+    const spread = open ? 0.9 : 0.25;
+    ctx.strokeStyle = "#3a3f46";
+    ctx.lineWidth = 3;
+    ctx.lineCap = "round";
+    for (const s of [-1, 0, 1]) {
+      const a = Math.PI * 0.5 + s * spread;
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(Math.sin(a) * HOOK_LEN, Math.cos(a) * HOOK_LEN);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // 抓到的物品跟随钩爪
+    if (grab) {
+      const gx = pos.x + Math.sin(angle) * (HOOK_LEN + 6);
+      const gy = pos.y + Math.cos(angle) * (HOOK_LEN + 6);
+      drawItem(grab, gx, gy, grab.size * 0.9);
+    }
+  }
+
+  function drawDust() {
+    for (let i = dust.length - 1; i >= 0; i--) {
+      const d = dust[i];
+      d.life--;
+      d.y -= 1.2;
+      ctx.globalAlpha = clamp(d.life / 30, 0, 1);
+      ctx.fillStyle = "#ffe08a";
+      ctx.font = "bold 16px 'PingFang SC', sans-serif";
+      ctx.fillText(d.text, d.x, d.y);
+      ctx.globalAlpha = 1;
+      if (d.life <= 0) dust.splice(i, 1);
+    }
+  }
+
+  function render() {
+    drawSky();
+    drawSoil();
+    drawItems();
+    drawMiner();
+    drawClaw();
+    drawDust();
+  }
+
+  // ---- input ----
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") {
+      angleDir = -1;
+      e.preventDefault();
+    } else if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") {
+      angleDir = 1;
+      e.preventDefault();
+    } else if (e.key === " " || e.key === "Enter") {
+      if (state === "aiming") shoot();
+      else if (state === "over") advance();
+      e.preventDefault();
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (["ArrowLeft", "ArrowRight", "a", "A", "d", "D"].includes(e.key)) angleDir = angle >= 0 ? -1 : 1;
+  });
+
+  let mouseX = null;
+  canvas.addEventListener("mousemove", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (W / rect.width);
+    mouseX = x;
+    if (state === "aiming") {
+      const dx = x - PIVOT.x;
+      angle = clamp(Math.atan2(dx, 200), -1.15, 1.15);
+    }
+  });
+  canvas.addEventListener("click", () => {
+    if (state === "aiming") shoot();
+    else if (state === "over") advance();
+  });
+
+  startBtn.addEventListener("click", () => {
+    if (state === "over") advance();
+    else startGame();
+  });
+
+  // ---- main loop ----
+  function loop(ts) {
+    if (!lastTs) lastTs = ts;
+    const dt = Math.min(0.1, (ts - lastTs) / 1000);
+    lastTs = ts;
+    frame++;
+
+    if (state === "aiming") {
+      updateAiming();
+    } else if (state === "shooting") {
+      updateShooting();
+    } else if (state === "pulling") {
+      updatePulling();
+    }
+
+    if (state === "aiming" || state === "shooting" || state === "pulling") {
+      timeLeft -= dt;
+      if (timeLeft <= 0) {
+        timeLeft = 0;
+        if (state === "aiming" || state === "shooting" || state === "pulling") {
+          result = { win: false };
+          endLevel();
+        }
+      }
+      updateHud();
+    }
+
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  // 初始画面
+  generateLevel(1);
+  state = "idle";
+  updateHud();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
